@@ -28,63 +28,77 @@ convert_to_mebibytes() {
   fi
 }
 
-# Function to retrieve resource information for a container
-get_container_resources() {
+# Function to retrieve resource information for a pod
+get_pod_resources() {
   local pod="$1"
-  local container="$2"
-  local namespace="$3"
+  local namespace="$2"
 
-  # Get resource information for the container
-  resource_info=$(kubectl get pod "$pod" -n "$namespace" -o json 2>/dev/null | jq -r '.spec.containers[] | select(.name == "'$container'") | .resources') 
+  # Get resource information for the pod
+  resource_info=$(kubectl get pod "$pod" -n "$namespace" -o json 2>/dev/null)
 
   if [[ -z "$resource_info" ]]; then
-    echo "$pod,$namespace,$container,Error,Error,Error,Error,Error,Error"
+    echo "$pod,$namespace,Error,Error,Error,Error,Error,Error"
     return
   fi
 
-  # Get resource limits and requests
-  limits_cpu=$(echo "$resource_info" | jq -r '.limits.cpu')
-  limits_memory=$(echo "$resource_info" | jq -r '.limits.memory')
-  requests_cpu=$(echo "$resource_info" | jq -r '.requests.cpu')
-  requests_memory=$(echo "$resource_info" | jq -r '.requests.memory')
+  # Initialize variables to aggregate resources across containers
+  limits_cpu_total=0
+  limits_memory_total=0
+  requests_cpu_total=0
+  requests_memory_total=0
 
-  # Get resource usage
-  usage_data=$(kubectl top pod "$pod" -n "$namespace" | awk -v container="$container" 'NR>1 && $1 == container {print $2, $3}' 2>/dev/null)
+  # Loop through all containers in the pod and aggregate their resource data
+  containers=$(echo "$resource_info" | jq -r '.spec.containers[].name')
+  for container in $containers; do
+    container_resources=$(echo "$resource_info" | jq -r '.spec.containers[] | select(.name == "'$container'").resources')
+    
+    # Get resource limits and requests for this container
+    limits_cpu=$(echo "$container_resources" | jq -r '.limits.cpu')
+    limits_memory=$(echo "$container_resources" | jq -r '.limits.memory')
+    requests_cpu=$(echo "$container_resources" | jq -r '.requests.cpu')
+    requests_memory=$(echo "$container_resources" | jq -r '.requests.memory')
+
+    # Accumulate resources across containers
+    limits_cpu_total=$((limits_cpu_total + $(convert_to_millicores "$limits_cpu")))
+    limits_memory_total=$((limits_memory_total + $(convert_to_mebibytes "$limits_memory")))
+    requests_cpu_total=$((requests_cpu_total + $(convert_to_millicores "$requests_cpu")))
+    requests_memory_total=$((requests_memory_total + $(convert_to_mebibytes "$requests_memory")))
+  done
+
+  # Get resource usage for the pod
+  usage_data=$(kubectl top pod "$pod" -n "$namespace" | awk 'NR>1 {print $1, $2, $3, $4}' 2>/dev/null)
 
   # Check if any value retrieval failed and set those values to "Error"
-  if [[ -z "$limits_cpu" || -z "$limits_memory" || -z "$requests_cpu" || -z "$requests_memory" || -z "$usage_data" ]]; then
-    echo "$pod,$namespace,$container,Error,Error,Error,Error,Error,Error"
+  if [[ -z "$usage_data" ]]; then
+    echo "$pod,$namespace,Error,Error,Error,Error,Error,Error"
     return
   fi
 
-  # Extract resource data
-  limits_cpu_millicores=$(convert_to_millicores "$limits_cpu")
-  limits_memory_mebibytes=$(convert_to_mebibytes "$limits_memory")
-  requests_cpu_millicores=$(convert_to_millicores "$requests_cpu")
-  requests_memory_mebibytes=$(convert_to_mebibytes "$requests_memory")
+  # Calculate resource usage by summing values across all containers in the pod
+  usage_cpu_total=0
+  usage_memory_total=0
+  while read -r line; do
+    container=$(echo "$line" | awk '{print $1}')
+    cpu_usage=$(echo "$line" | awk '{print $2}')
+    memory_usage=$(echo "$line" | awk '{print $4}')
 
-  # Get resource usage
-  usage_cpu=$(echo "$usage_data" | awk '{print $1}')
-  usage_memory=$(echo "$usage_data" | awk '{print $2}')
+    usage_cpu_total=$((usage_cpu_total + $(convert_to_millicores "$cpu_usage")))
+    usage_memory_total=$((usage_memory_total + $(convert_to_mebibytes "$memory_usage")))
+  done <<< "$usage_data"
 
-  # Remove alpha characters from usage values
-  usage_cpu_millicores=$(convert_to_millicores "$usage_cpu")
-  usage_memory_mebibytes=$(convert_to_mebibytes "$usage_memory")
-
-  # Print the information in CSV format
-  echo "$pod,$namespace,$container,$limits_cpu_millicores,$requests_cpu_millicores,$usage_cpu_millicores,$limits_memory_mebibytes,$requests_memory_mebibytes,$usage_memory_mebibytes"
+  # Print the aggregated information in CSV format
+  echo "$pod,$namespace,$limits_cpu_total,$requests_cpu_total,$usage_cpu_total,$limits_memory_total,$requests_memory_total,$usage_memory_total"
 }
 
 # Print CSV header
-echo "Pod,Namespace,Container,Limits CPU m,Requests CPU m,Usage CPU m,Limits Memory MiB,Requests Memory MiB,Usage Memory MiB"
+echo "Pod,Namespace,Limits CPU m,Requests CPU m,Usage CPU m,Limits Memory MiB,Requests Memory MiB,Usage Memory MiB"
 
-# Get a list of all containers in all pods across all namespaces
-containers=$(kubectl get pods --all-namespaces -o custom-columns="NAMESPACE:.metadata.namespace,POD:.metadata.name,CONTAINER:.spec.containers[*].name" --no-headers)
+# Get a list of all pods across all namespaces
+pods=$(kubectl get pods --all-namespaces -o custom-columns="NAMESPACE:.metadata.namespace,POD:.metadata.name" --no-headers)
 
-# Iterate through the list of containers and retrieve resource information
+# Iterate through the list of pods and retrieve resource information
 while read -r line; do
   namespace=$(echo "$line" | awk '{print $1}')
   pod=$(echo "$line" | awk '{print $2}')
-  container=$(echo "$line" | awk '{print $3}')
-  get_container_resources "$pod" "$container" "$namespace"
-done <<< "$containers"
+  get_pod_resources "$pod" "$namespace"
+done <<< "$pods"
