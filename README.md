@@ -34,39 +34,42 @@ get_container_resources() {
   local container="$2"
   local namespace="$3"
 
-  local resource_data
-  resource_data=$(kubectl get pod "$pod" -n "$namespace" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources}") || resource_data="Error"
+  # Get resource information for the container
+  resource_info=$(kubectl get pod "$pod" -n "$namespace" -o json 2>/dev/null | jq -r '.spec.containers[] | select(.name == "'$container'") | .resources') 
 
-  if [[ "$resource_data" == "Error" ]]; then
+  if [[ -z "$resource_info" ]]; then
     echo "$pod,$namespace,$container,Error,Error,Error,Error,Error,Error"
     return
   fi
 
   # Get resource limits and requests
-  limits_cpu=$(echo "$resource_data" | jq -r '.limits.cpu')
-  limits_memory=$(echo "$resource_data" | jq -r '.limits.memory')
-  requests_cpu=$(echo "$resource_data" | jq -r '.requests.cpu')
-  requests_memory=$(echo "$resource_data" | jq -r '.requests.memory')
+  limits_cpu=$(echo "$resource_info" | jq -r '.limits.cpu')
+  limits_memory=$(echo "$resource_info" | jq -r '.limits.memory')
+  requests_cpu=$(echo "$resource_info" | jq -r '.requests.cpu')
+  requests_memory=$(echo "$resource_info" | jq -r '.requests.memory')
 
   # Get resource usage
-  usage_data=$(kubectl top pod "$pod" -n "$namespace" | awk 'NR>1 {print $2, $3}')
+  usage_data=$(kubectl top pod "$pod" -n "$namespace" | awk -v container="$container" 'NR>1 && $1 == container {print $2, $3}' 2>/dev/null)
+
+  # Check if any value retrieval failed and set those values to "Error"
+  if [[ -z "$limits_cpu" || -z "$limits_memory" || -z "$requests_cpu" || -z "$requests_memory" || -z "$usage_data" ]]; then
+    echo "$pod,$namespace,$container,Error,Error,Error,Error,Error,Error"
+    return
+  fi
+
+  # Extract resource data
+  limits_cpu_millicores=$(convert_to_millicores "$limits_cpu")
+  limits_memory_mebibytes=$(convert_to_mebibytes "$limits_memory")
+  requests_cpu_millicores=$(convert_to_millicores "$requests_cpu")
+  requests_memory_mebibytes=$(convert_to_mebibytes "$requests_memory")
+
+  # Get resource usage
   usage_cpu=$(echo "$usage_data" | awk '{print $1}')
   usage_memory=$(echo "$usage_data" | awk '{print $2}')
 
-  # Remove alpha characters from memory values
-  limits_memory_clean="${limits_memory//[^0-9GiMi]/}"
-  requests_memory_clean="${requests_memory//[^0-9GiMi]/}"
-  usage_memory_clean="${usage_memory//[^0-9GiMi]/}"
-
-  # Convert CPU values to milli-cores
-  limits_cpu_millicores=$(convert_to_millicores "$limits_cpu")
-  requests_cpu_millicores=$(convert_to_millicores "$requests_cpu")
+  # Remove alpha characters from usage values
   usage_cpu_millicores=$(convert_to_millicores "$usage_cpu")
-
-  # Convert memory values to Mebibytes (MiB)
-  limits_memory_mebibytes=$(convert_to_mebibytes "$limits_memory_clean")
-  requests_memory_mebibytes=$(convert_to_mebibytes "$requests_memory_clean")
-  usage_memory_mebibytes=$(convert_to_mebibytes "$usage_memory_clean")
+  usage_memory_mebibytes=$(convert_to_mebibytes "$usage_memory")
 
   # Print the information in CSV format
   echo "$pod,$namespace,$container,$limits_cpu_millicores,$requests_cpu_millicores,$usage_cpu_millicores,$limits_memory_mebibytes,$requests_memory_mebibytes,$usage_memory_mebibytes"
